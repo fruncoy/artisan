@@ -1,0 +1,56 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAuthed() { return request.auth != null; }
+    function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function isAdmin() { return isAuthed() && userDoc().data.role == 'admin'; }
+    function isArtisan() { return isAuthed() && userDoc().data.role == 'artisan' && userDoc().data.artisanStatus == 'approved'; }
+
+    match /users/{uid} {
+      allow read: if isAuthed() && (request.auth.uid == uid || isAdmin());
+      allow create: if isAuthed() && request.auth.uid == uid;
+      allow update: if isAuthed() && (request.auth.uid == uid || isAdmin());
+    }
+
+    match /artisanApplications/{uid} {
+      allow read: if isAuthed() && (request.auth.uid == uid || isAdmin());
+      allow create, update: if isAuthed() && request.auth.uid == uid;
+    }
+
+    match /products/{productId} {
+      allow read: if true;
+      allow create, update, delete: if isArtisan() || isAdmin();
+    }
+
+    match /orders/{orderId} {
+      allow read: if isAuthed() &&
+        (resource.data.customerId == request.auth.uid ||
+         resource.data.artisanId == request.auth.uid ||
+         isAdmin());
+      allow create: if isAuthed() && request.resource.data.customerId == request.auth.uid;
+      allow update: if isAuthed() &&
+        (resource.data.customerId == request.auth.uid ||
+         resource.data.artisanId == request.auth.uid ||
+         isAdmin());
+    }
+
+    match /stores/{storeId} {
+      allow read: if true;
+      allow create, update: if isAuthed() &&
+        (request.auth.uid == storeId || isAdmin());
+    }
+
+    match /chats/{chatId} {
+      allow read: if isAuthed() &&
+        (resource.data.senderId == request.auth.uid ||
+         resource.data.recipientId == request.auth.uid ||
+         isAdmin());
+      allow create: if isAuthed() && request.resource.data.senderId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if isAdmin();
+    }
+  }
+}
