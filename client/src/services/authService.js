@@ -4,28 +4,35 @@ import { auth, db, googleProvider } from '@/firebase/config'
 import { ARTISAN_STATUS, ROLES } from '@/utils/constants'
 
 export async function signInWithGoogle(selectedRole) {
-  const result = await signInWithPopup(auth, googleProvider)
-  const user = result.user
-  const userRef = doc(db, 'users', user.uid)
-  const existing = await getDoc(userRef)
+  try {
+    const result = await signInWithPopup(auth, googleProvider)
+    const user = result.user
+    const userRef = doc(db, 'users', user.uid)
+    const existing = await getDoc(userRef)
 
-  if (!existing.exists()) {
-    await setDoc(userRef, {
-      uid: user.uid,
-      email: user.email,
-      displayName: user.displayName || '',
-      photoURL: user.photoURL || '',
-      role: selectedRole || ROLES.CUSTOMER,
-      artisanStatus:
-        selectedRole === ROLES.ARTISAN ? ARTISAN_STATUS.PENDING : null,
-      isSuspended: false,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    })
+    if (!existing.exists()) {
+      await setDoc(userRef, {
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName || '',
+        photoURL: user.photoURL || '',
+        role: selectedRole || ROLES.CUSTOMER,
+        artisanStatus:
+          selectedRole === ROLES.ARTISAN ? ARTISAN_STATUS.PENDING : null,
+        isSuspended: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      })
+    }
+
+    const profile = (await getDoc(userRef)).data()
+    return { firebaseUser: user, profile }
+  } catch (error) {
+    if (error.code === 'auth/cancelled-popup-request' || error.code === 'auth/popup-closed-by-user') {
+      return null
+    }
+    throw error
   }
-
-  const profile = (await getDoc(userRef)).data()
-  return { firebaseUser: user, profile }
 }
 
 export function logout() {

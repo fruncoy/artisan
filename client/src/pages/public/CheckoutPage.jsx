@@ -32,6 +32,11 @@ export function CheckoutPage() {
       return
     }
 
+    if (!user.location) {
+      setError('Please set your delivery location in your profile before checking out.')
+      return
+    }
+
     if ((user.walletBalance || 0) < total) {
       setError('Insufficient wallet balance. Please top up your wallet.')
       return

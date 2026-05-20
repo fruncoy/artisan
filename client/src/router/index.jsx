@@ -4,7 +4,7 @@ import { ProtectedRoute } from '@/components/auth/ProtectedRoute'
 import { DashboardLayout } from '@/layouts/DashboardLayout'
 import { ROLES } from '@/utils/constants'
 import { LandingPage } from '@/pages/public/LandingPage'
-import { LoginPage, SignupPage } from '@/pages/public/AuthPages'
+import { LoginPage, SignupPage, AdminLoginPage } from '@/pages/public/AuthPages'
 import { MarketplacePage, ProductPage, StorePage } from '@/pages/public/MarketplacePages'
 import { CheckoutPage } from '@/pages/public/CheckoutPage'
 import {
@@ -112,6 +112,7 @@ export const router = createBrowserRouter([
           { path: 'login', element: <LoginPage /> },
           { path: 'sign-in', element: <Navigate to="/login" replace /> },
           { path: 'signup', element: <SignupPage /> },
+          { path: 'admin/login', element: <AdminLoginPage /> },
         ],
       },
       { path: 'artisan/pending', element: <ArtisanPending /> },

@@ -3,6 +3,7 @@ import { doc, onSnapshot } from 'firebase/firestore'
 import { onAuthStateChanged } from 'firebase/auth'
 import { auth, db } from '@/firebase/config'
 import { logout, signInWithGoogle } from '@/services/authService'
+import api from '@/services/api'
 
 export const useAuthStore = create((set, get) => ({
   user: null,
@@ -18,7 +19,7 @@ export const useAuthStore = create((set, get) => ({
     const impUser = sessionStorage.getItem('impersonated_user')
     const origAdmin = sessionStorage.getItem('original_admin')
     
-    onAuthStateChanged(auth, (firebaseUser) => {
+    onAuthStateChanged(auth, async (firebaseUser) => {
       // Clean up previous snapshot listener
       const currentUnsubscribe = get().unsubscribe
       if (currentUnsubscribe) currentUnsubscribe()
@@ -26,6 +27,19 @@ export const useAuthStore = create((set, get) => ({
       if (!firebaseUser) {
         set({ user: null, loading: false, unsubscribe: null })
         return
+      }
+
+      // Sync user with server (welcome email, etc.)
+      try {
+        const token = await firebaseUser.getIdToken()
+        await api.post('/users/sync', {}, {
+          headers: { Authorization: `Bearer ${token}` }
+        })
+      } catch (err) {
+        // Only log if it's not a connection error (to avoid console noise when server is down)
+        if (err.code !== 'ERR_NETWORK') {
+          console.error('User sync failed:', err.message)
+        }
       }
       
       const userRef = doc(db, 'users', firebaseUser.uid)
@@ -47,8 +61,15 @@ export const useAuthStore = create((set, get) => ({
     })
   },
   signIn: async (role) => {
-    const response = await signInWithGoogle(role)
-    set({ user: response.profile })
+    try {
+      const response = await signInWithGoogle(role)
+      if (response) {
+        set({ user: response.profile })
+      }
+    } catch (error) {
+      console.error('Sign in failed:', error)
+      throw error
+    }
   },
   signOut: async () => {
     await logout()

@@ -5,6 +5,7 @@ service cloud.firestore {
     function userDoc() { return get(/databases/$(database)/documents/users/$(request.auth.uid)); }
     function isAdmin() { return isAuthed() && userDoc().data.role == 'admin'; }
     function isArtisan() { return isAuthed() && userDoc().data.role == 'artisan' && userDoc().data.artisanStatus == 'approved'; }
+    function isPendingArtisan() { return isAuthed() && userDoc().data.role == 'artisan'; }
 
     match /users/{uid} {
       allow read: if isAuthed() && (request.auth.uid == uid || isAdmin());
@@ -12,9 +13,16 @@ service cloud.firestore {
       allow update: if isAuthed() && (request.auth.uid == uid || isAdmin());
     }
 
-    match /artisanApplications/{uid} {
-      allow read: if isAuthed() && (request.auth.uid == uid || isAdmin());
-      allow create, update: if isAuthed() && request.auth.uid == uid;
+    match /transactions/{transId} {
+      allow read: if isAuthed() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create, update, delete: if false; // Only server-side via Admin SDK
+    }
+
+    match /notifications/{notifId} {
+      allow read: if isAuthed() && (resource.data.uid == request.auth.uid || isAdmin());
+      allow create: if false; // Only server-side
+      allow update: if isAuthed() && resource.data.uid == request.auth.uid;
+      allow delete: if isAuthed() && resource.data.uid == request.auth.uid;
     }
 
     match /products/{productId} {

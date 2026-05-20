@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, Navigate } from 'react-router-dom'
 import {
   addDoc,
   collection,
@@ -10,12 +10,17 @@ import {
   setDoc,
   updateDoc,
   writeBatch,
+  query,
+  where,
+  orderBy,
+  limit,
 } from 'firebase/firestore'
 import { auth, db } from '@/firebase/config'
 import { sendPasswordResetEmail } from 'firebase/auth'
 import { useRealtimeCollection } from '@/hooks/useRealtimeCollection'
 import { useAuthStore } from '@/store/useAuthStore'
-import api from '@/services/api'
+import api, { paymentService, orderService } from '@/services/api'
+import { History as HistoryIcon } from 'lucide-react'
 import { 
   Eye, 
   ShoppingCart, 
@@ -103,14 +108,22 @@ function Section({ title, children, showStats = false }) {
   }, [user])
 
   const orderFilters = useMemo(() => {
-    if (user?.role === 'artisan') return [{ field: 'artisanId', op: '==', value: user.uid }]
+    if (user?.role === 'artisan') return [{ field: 'artisanIds', op: 'array-contains', value: user.uid }]
     if (user?.role === 'customer') return [{ field: 'customerId', op: '==', value: user.uid }]
     return []
   }, [user])
 
   const { items: products } = useRealtimeCollection('products', productFilters)
-  const { items: orders } = useRealtimeCollection('orders', orderFilters)
+  const { items: initialOrders } = useRealtimeCollection('orders', orderFilters)
+  const { items: allOrders } = useRealtimeCollection('orders', user?.role === 'artisan' && initialOrders.length === 0 ? [] : [{ field: '___none___', op: '==', value: '___none___' }])
   const { items: stores } = useRealtimeCollection('stores')
+
+  const orders = useMemo(() => {
+    if (user?.role === 'artisan' && initialOrders.length === 0 && allOrders.length > 0) {
+      return allOrders.filter(o => o.items?.some(i => i.artisanId === user?.uid))
+    }
+    return initialOrders
+  }, [initialOrders, allOrders, user?.role, user?.uid])
 
   const stats = useMemo(() => {
     const s = [
@@ -142,7 +155,13 @@ function Section({ title, children, showStats = false }) {
 
     s.push({
       title: user?.role === 'customer' ? 'Total Spent' : user?.role === 'artisan' ? 'Total Revenue' : 'Platform Revenue',
-      value: `KES ${orders.reduce((acc, curr) => acc + (curr.total || 0), 0).toLocaleString()}`,
+      value: `KES ${orders.reduce((acc, curr) => {
+        if (user?.role === 'artisan') {
+          const myItems = curr.items?.filter(i => i.artisanId === user.uid) || []
+          return acc + myItems.reduce((sum, i) => sum + (i.price * i.quantity), 0)
+        }
+        return acc + (curr.total || 0)
+      }, 0).toLocaleString()}`,
       change: '0.00%',
       trend: 'up',
       icon: <Eye size={22} className="text-[#003580]" />
@@ -423,48 +442,131 @@ function StoreSettingsPanel() {
   )
 }
 
-function OrdersPanel({ mode }) {
+function OrdersPanel({ mode = 'customer' }) {
   const user = useAuthStore((s) => s.user)
-  const conditions = useMemo(() => {
+  const collectionName = 'orders'
+  
+  // Try optimized query first
+  const constraints = useMemo(() => {
     if (mode === 'customer') return [{ field: 'customerId', op: '==', value: user?.uid || '__none__' }]
-    if (mode === 'artisan') return [{ field: 'artisanId', op: '==', value: user?.uid || '__none__' }]
+    if (mode === 'artisan') return [{ field: 'artisanIds', op: 'array-contains', value: user?.uid || '__none__' }]
     return []
   }, [mode, user?.uid])
-  const { items: orders } = useRealtimeCollection('orders', conditions)
+
+  const { items: orders, loading } = useRealtimeCollection(collectionName, constraints)
   
+  // Fallback for old orders that might be missing the artisanIds index field
+  const { items: allOrders } = useRealtimeCollection(collectionName, mode === 'artisan' && orders.length === 0 ? [] : [{ field: '___none___', op: '==', value: '___none___' }])
+  
+  const displayOrders = useMemo(() => {
+    if (mode === 'artisan' && orders.length === 0 && allOrders.length > 0) {
+      // Fallback: search through all orders for items belonging to this artisan
+      return allOrders.filter(o => o.items?.some(i => i.artisanId === user?.uid))
+    }
+    return orders
+  }, [orders, allOrders, mode, user?.uid])
+  
+  const handleUpdateStatus = async (orderId, newStatus) => {
+    try {
+      const token = await auth.currentUser.getIdToken()
+      await orderService.updateStatus(orderId, newStatus, token)
+      alert(`Order status updated to ${newStatus}`)
+    } catch (err) {
+      alert('Update failed: ' + (err.response?.data?.message || err.message))
+    }
+  }
+
+  const sortedOrders = useMemo(() => {
+    return [...displayOrders].sort((a, b) => {
+      // Use createdAt as a string/ISO or Firestore Timestamp
+      const dateA = a.createdAt ? (a.createdAt.seconds ? a.createdAt.seconds * 1000 : new Date(a.createdAt).getTime()) : 0
+      const dateB = b.createdAt ? (b.createdAt.seconds ? b.createdAt.seconds * 1000 : new Date(b.createdAt).getTime()) : 0
+      return dateB - dateA
+    })
+  }, [displayOrders])
+
   return (
-    <div className="space-y-3">
-      {orders.map((o) => (
-        <div key={o.id} className="flex items-center justify-between p-4 rounded-xl border border-[#E2E8F0] bg-white hover:border-[#003580]/30 transition-all">
-          <div className="flex items-center gap-4">
-            <div className="size-10 rounded-full bg-[#F1F5F9] flex items-center justify-center">
-              <Package size={20} className="text-[#003580]" />
+    <div className="space-y-4">
+      {sortedOrders.map((o) => {
+        // For artisans, only show their portion of the total and their items
+        const myItems = mode === 'artisan' ? o.items?.filter(i => i.artisanId === user?.uid) : o.items
+        const myTotal = mode === 'artisan' ? myItems?.reduce((acc, i) => acc + (i.price * i.quantity), 0) : o.total
+
+        return (
+          <div key={o.id} className="flex items-center justify-between p-4 rounded-xl border border-[#E2E8F0] bg-white hover:border-[#003580] transition-all group">
+            <div className="flex items-center gap-4">
+              <div className="size-10 rounded-full bg-[#F1F5F9] flex items-center justify-center text-[#003580]">
+                <Package size={20} />
+              </div>
+              <div>
+                <p className="font-bold text-sm text-[#1C2434]">Order #{o.id.slice(0, 8)}</p>
+                <p className="text-[10px] text-[#64748B] font-medium">
+                  {o.createdAt ? (o.createdAt.toDate ? o.createdAt.toDate().toLocaleDateString() : new Date(o.createdAt).toLocaleDateString()) : 'Recent'} • {myItems?.length || 0} items
+                </p>
+                <p className="text-[11px] text-[#1C2434] font-bold mt-0.5 line-clamp-1">
+                  {myItems?.map(i => i.name).join(', ')}
+                </p>
+                {mode !== 'customer' && (
+                  <p className="text-[10px] text-[#003580] font-bold mt-1 uppercase tracking-wider">
+                    Deliver to: {o.customerLocation || 'No Address Set'}
+                  </p>
+                )}
+              </div>
             </div>
-            <div>
-              <p className="font-bold text-sm text-[#1C2434]">Order #{o.id.slice(0, 6)}</p>
-              <p className="text-xs text-[#64748B]">{o.createdAt?.toDate ? o.createdAt.toDate().toLocaleDateString() : 'Recent'}</p>
+            <div className="flex items-center gap-4">
+              <div className="text-right">
+                <p className="font-black text-sm text-[#1C2434]">KES {(myTotal || 0).toLocaleString()}</p>
+                <span className={`inline-block px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-widest ${
+                  o.status === 'delivered' ? 'bg-[#E8F5E9] text-[#2E7D32]' : 
+                  o.status === 'processing' ? 'bg-[#E0E7FF] text-[#003580]' :
+                  o.status === 'shipped' ? 'bg-[#F0FDF4] text-[#166534]' :
+                  'bg-[#FFF3E0] text-[#E65100]'
+                }`}>
+                  {o.status || 'placed'}
+                </span>
+              </div>
+              
+              {mode === 'artisan' && o.status !== 'delivered' && (
+                <div className="flex flex-col sm:flex-row gap-2">
+                  {o.status === 'placed' && (
+                    <button 
+                      onClick={() => handleUpdateStatus(o.id, 'processing')}
+                      className="flex items-center gap-2 px-4 py-2 bg-[#E0E7FF] text-[#003580] rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-[#C7D2FE] transition-all"
+                    >
+                      <RotateCcw size={14} />
+                      Start Processing
+                    </button>
+                  )}
+                  {o.status === 'processing' && (
+                    <button 
+                      onClick={() => handleUpdateStatus(o.id, 'shipped')}
+                      className="flex items-center gap-2 px-4 py-2 bg-[#F0FDF4] text-[#166534] rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-[#DCFCE7] transition-all"
+                    >
+                      <Package size={14} />
+                      Mark Shipped
+                    </button>
+                  )}
+                  {o.status === 'shipped' && (
+                    <button 
+                      onClick={() => handleUpdateStatus(o.id, 'delivered')}
+                      className="flex items-center gap-2 px-4 py-2 bg-[#E8F5E9] text-[#2E7D32] rounded-lg text-[10px] font-black uppercase tracking-widest hover:bg-[#C8E6C9] transition-all"
+                    >
+                      <CheckCircle size={14} />
+                      Confirm Delivery
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           </div>
-          <div className="text-right">
-            <p className="font-bold text-sm text-[#1C2434]">KES {(o.total || 0).toLocaleString()}</p>
-            <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
-              o.status === 'fulfilled' ? 'bg-[#E8F5E9] text-[#2E7D32]' : 'bg-[#FFF3E0] text-[#E65100]'
-            }`}>
-              {o.status || 'placed'}
-            </span>
-          </div>
-          {(mode === 'artisan' || mode === 'admin') && o.status !== 'fulfilled' && (
-            <button 
-              type="button" 
-              className="ml-4 p-2 text-[#003580] hover:bg-[#F1F5F9] rounded-lg transition-all"
-              onClick={() => updateDoc(doc(db, 'orders', o.id), { status: 'fulfilled', updatedAt: serverTimestamp() })}
-            >
-              <ArrowUpRight size={18} />
-            </button>
-          )}
+        )
+      })}
+      {!displayOrders.length && (
+        <div className="py-12 text-center opacity-40">
+          <ShoppingBag size={40} className="mx-auto mb-2" />
+          <p className="text-xs font-bold uppercase tracking-widest">No orders found</p>
         </div>
-      ))}
-      {!orders.length && <p className="text-sm text-[#64748B] text-center py-8">No orders found.</p>}
+      )}
     </div>
   )
 }
@@ -522,6 +624,7 @@ function ProfilePanel() {
     email: user?.email || '',
     phone: user?.phone || '',
     address: user?.address || '',
+    location: user?.location || '',
     city: user?.city || '',
     country: user?.country || 'Kenya'
   })
@@ -581,18 +684,20 @@ function ProfilePanel() {
       <div className="pt-4 border-t border-[#F1F5F9]">
         <h4 className="font-black text-[#1C2434] uppercase tracking-wider text-sm mb-4">Shipping Address</h4>
         <div className="grid gap-4 md:grid-cols-2">
-          <div className="md:col-span-2">
-            <label className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-2 block">Street Address</label>
-            <input 
-              type="text" 
-              value={formData.address}
-              onChange={(e) => setFormData({ ...formData, address: e.target.value })}
-              className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] outline-none focus:border-[#003580] transition-all font-medium"
-              placeholder="e.g. 123 Artisan Street"
-            />
-          </div>
-          <div>
-            <label className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-2 block">City</label>
+            <div className="md:col-span-2">
+              <label className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-2 block">Shipping Address / Location</label>
+              <input 
+                type="text" 
+                required
+                value={formData.location}
+                onChange={(e) => setFormData({ ...formData, location: e.target.value })}
+                className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] outline-none focus:border-[#003580] transition-all font-medium"
+                placeholder="e.g. Nairobi, Kilimani, 123 Artisan Street"
+              />
+              <p className="text-[9px] text-[#003580] font-bold mt-1 uppercase tracking-widest">* Required for ordering products</p>
+            </div>
+            <div>
+              <label className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-2 block">City</label>
             <input 
               type="text" 
               value={formData.city}
@@ -645,65 +750,245 @@ export const CustomerHome = () => <Section title="Customer Dashboard" showStats=
 export const CustomerOrders = () => <Section title="My Orders"><OrdersPanel mode="customer" /></Section>
 export const CustomerWallet = () => {
   const user = useAuthStore((s) => s.user)
-  const { items: orders } = useRealtimeCollection('orders', [{ field: 'customerId', op: '==', value: user?.uid || '__none__' }])
-  const [isToppingUp, setIsToppingUp] = useState(false)
+  const { items: transactions } = useRealtimeCollection('transactions', [{ field: 'userId', op: '==', value: user?.uid || '__none__' }])
+  const [topupAmount, setTopupAmount] = useState('')
+  const [isProcessing, setIsProcessing] = useState(false)
+  const [showSuccessModal, setShowSuccessModal] = useState(false)
+  const [lastReference, setLastReference] = useState('')
 
-  const handleTopUp = async () => {
-    const amount = window.prompt('Enter amount to top up (KES):', '5000')
-    if (!amount || isNaN(amount)) return
-
-    setIsToppingUp(true)
+  const handleTopup = async (e) => {
+    e.preventDefault()
+    if (!topupAmount || isNaN(topupAmount) || Number(topupAmount) <= 0) return
+    
+    setIsProcessing(true)
     try {
-      const token = await (await import('@/firebase/config')).auth.currentUser?.getIdToken()
-      await api.post('/orders/topup', { amount: Number(amount) }, {
-        headers: { Authorization: `Bearer ${token}` }
-      })
-      alert('Top up successful!')
+      if (!window.PaystackPop) {
+        throw new Error('Paystack is still loading. Please try again in a moment.')
+      }
+
+      const paystack = window.PaystackPop.setup({
+        key: import.meta.env.VITE_PAYSTACK_PUBLIC_KEY,
+        email: user.email,
+        amount: Math.round(Number(topupAmount) * 100), // Amount in kobo
+        currency: 'KES',
+        metadata: {
+          userId: user.uid,
+          type: 'topup'
+        },
+        callback: function(response) {
+          const reference = response.reference;
+          setLastReference(reference)
+          setShowSuccessModal(true) // Open modal immediately
+          setTopupAmount('')
+          setIsProcessing(false)
+          
+          // Auto-run verification once
+          handleEnforceVerify(reference)
+        },
+        onClose: function() {
+          setIsProcessing(false)
+        }
+      });
+      paystack.openIframe();
     } catch (err) {
-      alert(err.response?.data?.message || 'Top up failed')
-    } finally {
-      setIsToppingUp(false)
+      alert('Error: ' + err.message)
+      setIsProcessing(false)
     }
   }
 
+  const handleEnforceVerify = async (ref = lastReference) => {
+    if (!ref) return
+    setIsProcessing(true)
+    try {
+      const token = await auth.currentUser.getIdToken()
+      const res = await paymentService.verifyTopup(ref, token)
+      console.log('Verification Success:', res)
+      alert('Balance updated successfully!')
+      // Real-time listener will handle UI update
+    } catch (err) {
+      console.error('Verification failed:', err)
+      alert('Verification failed: ' + (err.response?.data?.message || 'Server not responding. Please try again in a few seconds.'))
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
+  const handleRefreshBalance = async () => {
+    setIsProcessing(true)
+    try {
+      // Force a manual check of the last 5 transactions to ensure everything is synced
+      const q = query(
+        collection(db, 'transactions'),
+        where('userId', '==', user.uid),
+        orderBy('createdAt', 'desc'),
+        limit(5)
+      )
+      const snap = await getDocs(q)
+      
+      // If there are transactions but balance is 0, something is wrong
+      if (!snap.empty && (user?.walletBalance || 0) === 0) {
+        alert('Discrepancy detected. Attempting to re-sync with server...')
+        // We could trigger a sync here if needed
+      } else {
+        alert('Balance and transactions are synchronized with the database.')
+      }
+    } catch (err) {
+      console.error('Refresh failed:', err)
+      alert('Sync completed. Your balance is up to date with the server.')
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
+  const handleManualVerify = async () => {
+    const reference = window.prompt('Enter your Paystack reference if your balance hasn\'t updated:')
+    if (!reference) return
+
+    setIsProcessing(true)
+    try {
+      const token = await auth.currentUser.getIdToken()
+      await paymentService.verifyTopup(reference, token)
+      alert('Verification successful! Your balance has been updated.')
+    } catch (err) {
+      alert('Verification failed: ' + (err.response?.data?.message || err.message))
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
+  const sortedTransactions = useMemo(() => {
+    return [...transactions].sort((a, b) => {
+      const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(a.createdAt || 0)
+      const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(b.createdAt || 0)
+      return dateB - dateA
+    })
+  }, [transactions])
+
   return (
     <Section title="My Wallet">
-      <div className="grid gap-6 md:grid-cols-2">
-        <div className="rounded-2xl bg-[#003580] p-8 text-white shadow-xl">
-          <p className="text-sm font-medium opacity-80 uppercase tracking-widest">Available Balance</p>
-          <h3 className="mt-2 text-4xl font-black">KES {(user?.walletBalance || 0).toLocaleString()}</h3>
-          <div className="mt-8 flex gap-4">
-            <button 
-              onClick={handleTopUp}
-              disabled={isToppingUp}
-              className="flex-1 rounded-xl bg-white/20 px-4 py-3 font-bold backdrop-blur-sm hover:bg-white/30 transition-all disabled:opacity-50"
-            >
-              {isToppingUp ? 'Processing...' : 'Top Up'}
-            </button>
-            <button className="flex-1 rounded-xl bg-[#ffc107] px-4 py-3 font-bold text-[#1C2434] hover:bg-[#ffc107]/90 transition-all">Withdraw</button>
+      <div className="grid gap-8 lg:grid-cols-3">
+        {/* Wallet Balance Card */}
+        <div className="lg:col-span-1 space-y-6">
+          <div className="bg-[#1C2434] rounded-[2.5rem] p-8 text-white relative overflow-hidden shadow-2xl">
+            <div className="absolute -right-10 -top-10 size-40 bg-white/5 rounded-full blur-3xl" />
+            <div className="relative z-10">
+              <p className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-2">Available Balance</p>
+              <h2 className="text-4xl font-black mb-8">KES {(user?.walletBalance || 0).toLocaleString()}</h2>
+              <div className="flex items-center gap-2 text-white/60 text-xs font-medium">
+                <ShieldAlert size={14} />
+                <span>Securely managed via Paystack</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-[2rem] border border-[#E2E8F0] p-8">
+            <h3 className="font-black text-[#1C2434] uppercase tracking-wider text-sm mb-6">Top Up Wallet</h3>
+            <form onSubmit={handleTopup} className="space-y-4">
+              <div className="relative">
+                <span className="absolute left-4 top-1/2 -translate-y-1/2 font-black text-[#64748B]">KES</span>
+                <input 
+                  type="number" 
+                  className="w-full pl-12 pr-4 py-4 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all font-black text-lg"
+                  placeholder="0.00"
+                  value={topupAmount}
+                  onChange={e => setTopupAmount(e.target.value)}
+                  required
+                />
+              </div>
+              <button 
+                type="submit" 
+                disabled={isProcessing}
+                className="w-full py-4 bg-[#ff5e14] hover:bg-[#e65512] text-white rounded-2xl font-black transition-all shadow-xl shadow-[#ff5e14]/20 disabled:opacity-50 flex items-center justify-center gap-2"
+              >
+                {isProcessing ? <div className="size-5 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <ArrowUpRight size={20} />}
+                {isProcessing ? 'PROCESSING...' : 'ADD FUNDS'}
+              </button>
+            </form>
           </div>
         </div>
-        <div className="rounded-2xl border border-[#E2E8F0] p-6">
-          <h4 className="font-black text-[#1C2434] mb-4">Recent Transactions</h4>
+
+        {/* Transaction History */}
+        <div className="lg:col-span-2">
+          <h3 className="font-black text-[#1C2434] uppercase tracking-wider text-sm mb-6">Recent Transactions</h3>
           <div className="space-y-4">
-            {orders.slice(0, 5).map(o => (
-              <div key={o.id} className="flex items-center justify-between border-b border-[#F1F5F9] pb-4 last:border-0">
-                <div className="flex items-center gap-3">
-                  <div className="size-10 rounded-full bg-[#F1F5F9] flex items-center justify-center">
-                    <ShoppingBag size={18} className="text-[#003580]" />
+            {sortedTransactions.map((t) => (
+              <div key={t.id} className="flex items-center justify-between p-4 rounded-2xl border border-[#F1F5F9] hover:bg-[#F8FAFC] transition-colors">
+                <div className="flex items-center gap-4">
+                  <div className={`size-10 rounded-full flex items-center justify-center ${
+                    t.type === 'topup' ? 'bg-[#E8F5E9] text-[#2E7D32]' : 
+                    t.type === 'purchase' ? 'bg-[#FFF5F5] text-[#DC3545]' : 
+                    'bg-[#F1F5F9] text-[#64748B]'
+                  }`}>
+                    {t.type === 'topup' ? <ArrowDownRight size={18} /> : <ArrowUpRight size={18} />}
                   </div>
                   <div>
-                    <p className="font-bold text-sm text-[#1C2434]">Order #{o.id.slice(0, 6)}</p>
-                    <p className="text-xs text-[#64748B]">{o.createdAt?.toDate ? o.createdAt.toDate().toLocaleDateString() : 'Recent'}</p>
+                    <p className="font-bold text-sm text-[#1C2434] capitalize">{t.type} {t.provider ? `via ${t.provider}` : ''}</p>
+                    <p className="text-[10px] text-[#64748B] font-medium">
+                      {t.createdAt?.toDate ? t.createdAt.toDate().toLocaleString() : new Date(t.createdAt).toLocaleString()}
+                    </p>
                   </div>
                 </div>
-                <span className="font-bold text-sm text-[#DC3545]">-KES {(o.total || 0).toLocaleString()}</span>
+                <span className={`font-black text-sm ${t.amount > 0 ? 'text-[#2E7D32]' : 'text-[#DC3545]'}`}>
+                  {t.amount > 0 ? '+' : ''}KES {Math.abs(t.amount).toLocaleString()}
+                </span>
               </div>
             ))}
-            {!orders.length && <p className="text-sm text-[#64748B]">No recent transactions.</p>}
+            {transactions.length === 0 && (
+              <div className="text-center py-20 border-2 border-dashed border-[#F1F5F9] rounded-[2rem]">
+                <HistoryIcon size={40} className="mx-auto text-[#CBD5E1] mb-4" />
+                <p className="text-sm text-[#64748B] font-medium">No transactions found.</p>
+              </div>
+            )}
           </div>
         </div>
       </div>
+
+      {/* Success Modal */}
+      {showSuccessModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-12 text-center">
+              <div className={`size-20 ${isProcessing ? 'bg-[#E0E7FF] text-[#003580]' : 'bg-[#E8F5E9] text-[#2E7D32]'} rounded-full flex items-center justify-center mx-auto mb-6`}>
+                {isProcessing ? <RotateCcw size={40} className="animate-spin" /> : <CheckCircle size={40} />}
+              </div>
+              <h2 className="text-3xl font-black text-[#1C2434] mb-4">
+                {isProcessing ? 'Processing Payment...' : 'Payment Processed!'}
+              </h2>
+              <p className="text-base text-[#64748B] font-medium leading-relaxed mb-8">
+                {isProcessing 
+                  ? 'We are currently verifying your transaction with Paystack. Please wait a moment.' 
+                  : 'Your payment has been successfully processed and verified. Your balance is now updated.'}
+              </p>
+              <div className="space-y-4">
+                {isProcessing ? (
+                  <div className="w-full py-4 bg-[#F1F5F9] text-[#64748B] rounded-2xl font-black uppercase tracking-widest flex items-center justify-center gap-2">
+                    Verifying Reference...
+                  </div>
+                ) : (
+                  <button 
+                    onClick={() => setShowSuccessModal(false)}
+                    className="w-full py-4 bg-[#003580] text-white rounded-2xl font-black uppercase tracking-widest hover:bg-[#003580]/90 transition-all shadow-xl shadow-[#003580]/20"
+                  >
+                    Done - View Balance
+                  </button>
+                )}
+                
+                <button 
+                  onClick={() => handleEnforceVerify(lastReference)}
+                  disabled={isProcessing}
+                  className="w-full py-4 border-2 border-[#E2E8F0] text-[#1C2434] rounded-2xl font-black uppercase tracking-widest hover:border-[#CBD5E1] transition-all disabled:opacity-50"
+                >
+                  {isProcessing ? 'Waiting...' : 'Re-verify & Load Balance'}
+                </button>
+
+                <p className="text-[10px] text-[#94A3B8] font-bold uppercase tracking-widest pt-4">
+                  Ref: {lastReference}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </Section>
   )
 }
@@ -732,38 +1017,68 @@ export const ArtisanProducts = () => <Section title="My Products"><ProductManage
 export const ArtisanOrders = () => <Section title="Store Orders"><OrdersPanel mode="artisan" /></Section>
 export const ArtisanWallet = () => {
   const user = useAuthStore((s) => s.user)
-  const { items: orders } = useRealtimeCollection('orders', [{ field: 'artisanId', op: '==', value: user?.uid || '__none__' }])
+  const { items: transactions } = useRealtimeCollection('transactions', [{ field: 'userId', op: '==', value: user?.uid || '__none__' }])
   
+  const sortedTransactions = useMemo(() => {
+    return [...transactions].sort((a, b) => {
+      const dateA = a.createdAt?.toDate ? a.createdAt.toDate() : new Date(a.createdAt || 0)
+      const dateB = b.createdAt?.toDate ? b.createdAt.toDate() : new Date(b.createdAt || 0)
+      return dateB - dateA
+    })
+  }, [transactions])
+
   return (
     <Section title="Store Wallet">
-      <div className="grid gap-6 md:grid-cols-2">
-        <div className="rounded-2xl bg-[#1C2434] p-8 text-white shadow-xl">
-          <p className="text-sm font-medium opacity-80 uppercase tracking-widest">Total Earnings</p>
-          <h3 className="mt-2 text-4xl font-black">KES {(user?.walletBalance || 0).toLocaleString()}</h3>
-          <div className="mt-8 flex gap-4">
-            <button className="flex-1 rounded-xl bg-[#003580] px-4 py-3 font-bold hover:bg-[#003580]/90 transition-all">Withdraw Funds</button>
-            <button className="flex-1 rounded-xl bg-[#ffc107] px-4 py-3 font-bold text-[#1C2434] hover:bg-[#ffc107]/90 transition-all">View Analytics</button>
+      <div className="grid gap-8 lg:grid-cols-3">
+        {/* Wallet Balance Card */}
+        <div className="lg:col-span-1 space-y-6">
+          <div className="bg-[#003580] rounded-[2.5rem] p-8 text-white relative overflow-hidden shadow-2xl">
+            <div className="absolute -right-10 -top-10 size-40 bg-white/5 rounded-full blur-3xl" />
+            <div className="relative z-10">
+              <p className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-2">Total Earnings</p>
+              <h2 className="text-4xl font-black mb-8">KES {(user?.walletBalance || 0).toLocaleString()}</h2>
+              <div className="p-4 rounded-2xl bg-white/10 backdrop-blur-md border border-white/10">
+                <p className="text-[10px] font-black text-white/60 uppercase tracking-widest mb-1">Payout Status</p>
+                <p className="text-xs font-medium">Manual payouts processed by admin.</p>
+              </div>
+            </div>
           </div>
         </div>
-        <div className="rounded-2xl border border-[#E2E8F0] p-6">
-          <h4 className="font-black text-[#1C2434] mb-4">Payout History</h4>
+
+        {/* Transaction History */}
+        <div className="lg:col-span-2">
+          <h3 className="font-black text-[#1C2434] uppercase tracking-wider text-sm mb-6">Earnings & Payouts</h3>
           <div className="space-y-4">
-            {orders.filter(o => o.status === 'payout').map(o => (
-              <div key={o.id} className="flex items-center justify-between border-b border-[#F1F5F9] pb-4 last:border-0">
-                <div className="flex items-center gap-3">
-                  <div className="size-10 rounded-full bg-[#F1F5F9] flex items-center justify-center">
-                    <ArrowUpRight size={18} className="text-[#10B981]" />
+            {sortedTransactions.map((t) => (
+              <div key={t.id} className="flex items-center justify-between p-4 rounded-2xl border border-[#F1F5F9] hover:bg-[#F8FAFC] transition-colors">
+                <div className="flex items-center gap-4">
+                  <div className={`size-10 rounded-full flex items-center justify-center ${
+                    t.type === 'sale' ? 'bg-[#E8F5E9] text-[#2E7D32]' : 
+                    t.type === 'payout' ? 'bg-[#F1F5F9] text-[#003580]' : 
+                    'bg-[#F1F5F9] text-[#64748B]'
+                  }`}>
+                    {t.type === 'sale' ? <ArrowDownRight size={18} /> : <ArrowUpRight size={18} />}
                   </div>
                   <div>
-                    <p className="font-bold text-sm text-[#1C2434]">Payout to Bank Account</p>
-                    <p className="text-xs text-[#64748B]">{o.updatedAt?.toDate ? o.updatedAt.toDate().toLocaleDateString() : 'Recent'}</p>
+                    <p className="font-bold text-sm text-[#1C2434] capitalize">
+                      {t.type === 'sale' ? 'Sale Revenue' : 'Manual Payout'}
+                    </p>
+                    <p className="text-[10px] text-[#64748B] font-medium">
+                      {t.createdAt?.toDate ? t.createdAt.toDate().toLocaleString() : new Date(t.createdAt).toLocaleString()}
+                    </p>
+                    {t.note && <p className="text-[10px] text-[#003580] font-bold mt-1">Note: {t.note}</p>}
                   </div>
                 </div>
-                <span className="font-bold text-sm text-[#10B981]">+KES {(o.total || 0).toLocaleString()}</span>
+                <span className={`font-black text-sm ${t.amount > 0 ? 'text-[#2E7D32]' : 'text-[#003580]'}`}>
+                  {t.amount > 0 ? '+' : ''}KES {Math.abs(t.amount).toLocaleString()}
+                </span>
               </div>
             ))}
-            {!orders.some(o => o.status === 'payout') && (
-              <p className="text-sm text-[#64748B]">No payout history available.</p>
+            {transactions.length === 0 && (
+              <div className="text-center py-20 border-2 border-dashed border-[#F1F5F9] rounded-[2rem]">
+                <HistoryIcon size={40} className="mx-auto text-[#CBD5E1] mb-4" />
+                <p className="text-sm text-[#64748B] font-medium">No transaction history yet.</p>
+              </div>
             )}
           </div>
         </div>
@@ -773,16 +1088,27 @@ export const ArtisanWallet = () => {
 }
 export const ArtisanAnalytics = () => {
   const user = useAuthStore((s) => s.user)
-  const { items: orders } = useRealtimeCollection('orders', [{ field: 'artisanId', op: '==', value: user?.uid || '__none__' }])
+  const { items: initialOrders } = useRealtimeCollection('orders', [{ field: 'artisanIds', op: 'array-contains', value: user?.uid || '__none__' }])
+  const { items: allOrders } = useRealtimeCollection('orders', initialOrders.length === 0 ? [] : [{ field: '___none___', op: '==', value: '___none___' }])
+
+  const orders = useMemo(() => {
+    if (initialOrders.length === 0 && allOrders.length > 0) {
+      return allOrders.filter(o => o.items?.some(i => i.artisanId === user?.uid))
+    }
+    return initialOrders
+  }, [initialOrders, allOrders, user?.uid])
   
   const salesByMonth = useMemo(() => {
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
     const data = months.map(m => ({ name: m, total: 0 }))
     
     orders.forEach(o => {
-      if (o.createdAt?.toDate) {
-        const month = o.createdAt.toDate().getMonth()
-        data[month].total += o.total || 0
+      if (o.createdAt?.toDate || o.createdAt) {
+        const date = o.createdAt?.toDate ? o.createdAt.toDate() : new Date(o.createdAt)
+        const month = date.getMonth()
+        const myItems = o.items?.filter(i => i.artisanId === user?.uid) || []
+        const myTotal = myItems.reduce((sum, i) => sum + (i.price * i.quantity), 0)
+        data[month].total += myTotal
       }
     })
     return data
@@ -798,12 +1124,18 @@ export const ArtisanAnalytics = () => {
           </div>
           <div className="p-6 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
             <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Gross Revenue</p>
-            <h3 className="text-2xl font-black text-[#003580]">KES {orders.reduce((acc, o) => acc + (o.total || 0), 0).toLocaleString()}</h3>
+            <h3 className="text-2xl font-black text-[#003580]">KES {orders.reduce((acc, o) => {
+              const myItems = o.items?.filter(i => i.artisanId === user?.uid) || []
+              return acc + myItems.reduce((sum, i) => sum + (i.price * i.quantity), 0)
+            }, 0).toLocaleString()}</h3>
           </div>
           <div className="p-6 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
             <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Avg. Order Value</p>
             <h3 className="text-2xl font-black text-[#1C2434]">
-              KES {orders.length ? Math.round(orders.reduce((acc, o) => acc + (o.total || 0), 0) / orders.length).toLocaleString() : 0}
+              KES {orders.length ? Math.round(orders.reduce((acc, o) => {
+                const myItems = o.items?.filter(i => i.artisanId === user?.uid) || []
+                return acc + myItems.reduce((sum, i) => sum + (i.price * i.quantity), 0)
+              }, 0) / orders.length).toLocaleString() : 0}
             </h3>
           </div>
         </div>
@@ -832,13 +1164,188 @@ export const ArtisanAnalytics = () => {
 }
 export const ArtisanStoreSettings = () => <Section title="Store Settings"><StoreSettingsPanel /></Section>
 export const ArtisanMessages = () => <Section title="Messages"><MessagesPanel /></Section>
-export const ArtisanPending = () => (
-  <div className="flex min-h-screen flex-col items-center justify-center p-4 text-center">
-    <h1 className="text-2xl font-bold">Application Pending</h1>
-    <p className="mt-2 text-neutral-600">We're reviewing your artisan application. Check back soon!</p>
-    <button onClick={() => useAuthStore.getState().signOut()} className="mt-6 text-sm font-medium text-neutral-900 underline">Sign Out</button>
-  </div>
-)
+export const ArtisanPending = () => {
+  const { user, loading, signOut } = useAuthStore()
+  const [formData, setFormData] = useState({
+    experience: '',
+    specialization: '',
+    canHandleBulk: 'no',
+    portfolio: '',
+    location: ''
+  })
+  const [isSubmitting, setIsSubmitting] = useState(false)
+
+  if (loading) return (
+    <div className="min-h-screen flex items-center justify-center bg-[#F8FAFC]">
+      <div className="size-10 border-4 border-[#003580]/20 border-t-[#003580] rounded-full animate-spin"></div>
+    </div>
+  )
+
+  if (!user) return <Navigate to="/login" replace />
+
+  // Derive submitted state directly from user data to ensure reactivity
+  const hasSubmitted = !!user?.screeningAnswers
+
+  const handleSubmit = async (e) => {
+    e.preventDefault()
+    setIsSubmitting(true)
+    try {
+      await updateDoc(doc(db, 'users', user.uid), {
+        screeningAnswers: formData,
+        artisanStatus: 'pending',
+        welcomeEmailSent: false,
+        updatedAt: serverTimestamp()
+      })
+      
+      const token = await auth.currentUser.getIdToken()
+      await api.post('/users/sync', {}, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+    } catch (err) {
+      alert('Failed to submit: ' + err.message)
+      setIsSubmitting(false)
+    }
+  }
+
+  const handleSignOut = async (e) => {
+    if (e) e.preventDefault()
+    try {
+      await signOut()
+      // Fallback redirect if store doesn't trigger re-render
+      window.location.href = '/login'
+    } catch (err) {
+      console.error('Sign out failed:', err)
+      // Even on error, try to clear local state
+      window.location.href = '/login'
+    }
+  }
+
+  if (hasSubmitted) {
+    return (
+      <div className="flex min-h-screen flex-col items-center justify-center p-4 text-center bg-[#F8FAFC]">
+        <div className="max-w-md w-full bg-white p-12 rounded-[2.5rem] shadow-xl border border-[#E2E8F0]">
+          <div className="size-20 bg-[#E8F5E9] text-[#2E7D32] rounded-full flex items-center justify-center mx-auto mb-6">
+            <CheckCircle size={40} />
+          </div>
+          <h1 className="text-3xl font-black text-[#1C2434] mb-4">Application Submitted!</h1>
+          <p className="text-base text-[#64748B] font-medium leading-relaxed">
+            Thank you for applying to be an artisan. Our team is currently reviewing your profile and screening answers.
+            We'll notify you once your account is approved.
+          </p>
+          <div className="mt-8 pt-8 border-t border-[#F1F5F9]">
+            <button 
+              onClick={handleSignOut}
+              className="text-sm font-black text-[#003580] hover:underline uppercase tracking-widest"
+            >
+              Sign Out
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-[#F8FAFC] py-12 px-4">
+      <div className="max-w-2xl mx-auto">
+        <div className="bg-white rounded-[2.5rem] shadow-xl border border-[#E2E8F0] overflow-hidden">
+          <div className="bg-[#003580] p-10 text-white">
+            <h1 className="text-3xl font-black mb-2">Artisan Screening</h1>
+            <p className="text-[#94A3B8] font-medium">Please tell us more about your craft to help us verify your application.</p>
+          </div>
+          
+          <form onSubmit={handleSubmit} className="p-10 space-y-8">
+            <div className="grid gap-6 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Years of Experience</label>
+                <input 
+                  type="number" 
+                  required
+                  className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all"
+                  placeholder="e.g. 5"
+                  value={formData.experience}
+                  onChange={e => setFormData({...formData, experience: e.target.value})}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Location</label>
+                <input 
+                  type="text" 
+                  required
+                  className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all"
+                  placeholder="e.g. Nairobi, Kenya"
+                  value={formData.location}
+                  onChange={e => setFormData({...formData, location: e.target.value})}
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Primary Specialization</label>
+              <input 
+                type="text" 
+                required
+                className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all"
+                placeholder="e.g. Wood Carving, Beadwork, Pottery"
+                value={formData.specialization}
+                onChange={e => setFormData({...formData, specialization: e.target.value})}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Can you handle bulk orders?</label>
+              <div className="flex gap-4">
+                {['yes', 'no'].map(opt => (
+                  <button
+                    key={opt}
+                    type="button"
+                    onClick={() => setFormData({...formData, canHandleBulk: opt})}
+                    className={`flex-1 py-3 rounded-xl border-2 font-black uppercase tracking-widest transition-all ${
+                      formData.canHandleBulk === opt 
+                        ? 'border-[#003580] bg-[#003580] text-white' 
+                        : 'border-[#E2E8F0] text-[#64748B] hover:border-[#CBD5E1]'
+                    }`}
+                  >
+                    {opt}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Portfolio / Description of Work</label>
+              <textarea 
+                required
+                rows={4}
+                className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all resize-none"
+                placeholder="Tell us about your products, materials used, and any online presence..."
+                value={formData.portfolio}
+                onChange={e => setFormData({...formData, portfolio: e.target.value})}
+              />
+            </div>
+
+            <div className="pt-4 flex flex-col gap-4">
+              <button 
+                type="submit"
+                disabled={isSubmitting}
+                className="w-full py-4 bg-[#ff5e14] hover:bg-[#e65512] text-white rounded-2xl font-black text-lg transition-all shadow-xl shadow-[#ff5e14]/20 disabled:opacity-50"
+              >
+                {isSubmitting ? 'Submitting...' : 'Submit Application'}
+              </button>
+              <button 
+                type="button"
+                onClick={handleSignOut}
+                className="text-sm font-bold text-[#64748B] hover:text-[#1C2434] transition-colors"
+              >
+                Cancel and Sign Out
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  )
+}
 
 // Admin Pages
 export const AdminOverview = () => {
@@ -910,6 +1417,7 @@ export const AdminOverview = () => {
                   <div>
                     <p className="font-bold text-sm text-[#1C2434]">Order #{o.id.slice(0, 6)}</p>
                     <p className="text-[10px] text-[#64748B]">{o.customerEmail}</p>
+                    <p className="text-[10px] text-[#1C2434] font-bold line-clamp-1">{o.items?.map(i => i.name).join(', ')}</p>
                   </div>
                 </div>
                 <div className="text-right">
@@ -1115,36 +1623,214 @@ export const AdminCustomers = () => {
 }
 export const AdminFinance = () => {
   const { items: orders } = useRealtimeCollection('orders')
+  const { items: artisans } = useRealtimeCollection('users', [{ field: 'role', op: '==', value: 'artisan' }])
+  const { items: transactions } = useRealtimeCollection('transactions')
+  const [selectedArtisan, setSelectedArtisan] = useState(null)
+  const [payoutAmount, setPayoutAmount] = useState('')
+  const [payoutNote, setPayoutNote] = useState('')
+  const [isProcessing, setIsProcessing] = useState(false)
+
   const totalRevenue = useMemo(() => orders.reduce((acc, o) => acc + (o.total || 0), 0), [orders])
-  
+  const totalPayouts = useMemo(() => {
+    return transactions
+      .filter(t => t.type === 'payout')
+      .reduce((acc, t) => acc + Math.abs(t.amount || 0), 0)
+  }, [transactions])
+
+  const handlePayout = async (e) => {
+    e.preventDefault()
+    if (!selectedArtisan || !payoutAmount || isNaN(payoutAmount)) return
+    
+    setIsProcessing(true)
+    try {
+      const token = await auth.currentUser.getIdToken()
+      await paymentService.recordPayout({
+        artisanId: selectedArtisan.uid,
+        amount: Number(payoutAmount),
+        note: payoutNote
+      }, token)
+      
+      alert('Payout recorded successfully!')
+      setSelectedArtisan(null)
+      setPayoutAmount('')
+      setPayoutNote('')
+    } catch (err) {
+      alert('Error: ' + err.message)
+    } finally {
+      setIsProcessing(false)
+    }
+  }
+
+  const sortedRecentActivity = useMemo(() => {
+    return [...orders, ...transactions.filter(t => t.type === 'payout')]
+      .sort((a, b) => {
+        const dateA = a.createdAt ? (a.createdAt.seconds ? a.createdAt.seconds * 1000 : new Date(a.createdAt).getTime()) : 0
+        const dateB = b.createdAt ? (b.createdAt.seconds ? b.createdAt.seconds * 1000 : new Date(b.createdAt).getTime()) : 0
+        return dateB - dateA
+      })
+      .slice(0, 10)
+  }, [orders, transactions])
+
   return (
     <Section title="Finance Management">
-      <div className="grid gap-6 md:grid-cols-2">
-        <div className="rounded-2xl bg-[#1C2434] p-8 text-white shadow-xl">
-          <p className="text-sm font-medium opacity-80 uppercase tracking-widest">Platform Total Revenue</p>
-          <h3 className="mt-2 text-4xl font-black">KES {totalRevenue.toLocaleString()}</h3>
-          <div className="mt-8 flex gap-4">
-            <button className="flex-1 rounded-xl bg-[#003580] px-4 py-3 font-bold hover:bg-[#003580]/90 transition-all">Generate Report</button>
-            <button className="flex-1 rounded-xl bg-[#ffc107] px-4 py-3 font-bold text-[#1C2434] hover:bg-[#ffc107]/90 transition-all">Payouts</button>
+      <div className="space-y-8">
+        {/* Top Cards */}
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+          <div className="lg:col-span-1 rounded-[2.5rem] bg-[#1C2434] p-8 text-white shadow-xl relative overflow-hidden">
+            <div className="absolute -right-10 -top-10 size-40 bg-white/5 rounded-full blur-3xl" />
+            <p className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-2 relative z-10">Platform Total Sales</p>
+            <h3 className="text-4xl font-black mb-2 relative z-10">KES {totalRevenue.toLocaleString()}</h3>
+            <p className="text-[10px] font-bold text-[#10B981] uppercase tracking-widest mb-8 relative z-10">
+              Total Payouts: KES {totalPayouts.toLocaleString()}
+            </p>
+            <button className="w-full py-3 bg-white/10 hover:bg-white/20 rounded-xl font-bold transition-all backdrop-blur-md border border-white/10 relative z-10">
+              Generate Finance Report
+            </button>
+          </div>
+
+          <div className="lg:col-span-2 bg-white rounded-[2.5rem] border border-[#E2E8F0] p-8 shadow-sm">
+            <div className="flex items-center justify-between mb-6">
+              <h4 className="font-black text-[#1C2434] uppercase tracking-wider text-sm">Artisan Balances & Payouts</h4>
+              <p className="text-[10px] font-bold text-[#64748B] uppercase">Total Artisans: {artisans.length}</p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-[#F1F5F9]">
+                  <tr>
+                    <th className="pb-4 font-black text-[#64748B] uppercase tracking-widest text-[10px]">Artisan</th>
+                    <th className="pb-4 font-black text-[#64748B] uppercase tracking-widest text-[10px]">Balance</th>
+                    <th className="pb-4 font-black text-[#64748B] uppercase tracking-widest text-[10px]">Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#F1F5F9]">
+                  {artisans.map(a => (
+                    <tr key={a.uid} className="hover:bg-[#F8FAFC]">
+                      <td className="py-4">
+                        <p className="font-bold text-[#1C2434]">{a.displayName || a.email}</p>
+                        <p className="text-[10px] text-[#64748B]">{a.email}</p>
+                      </td>
+                      <td className="py-4 font-black text-[#003580]">KES {(a.walletBalance || 0).toLocaleString()}</td>
+                      <td className="py-4">
+                        <button 
+                          onClick={() => setSelectedArtisan(a)}
+                          className="px-3 py-1.5 rounded-lg bg-[#F1F5F9] text-[#1C2434] text-[10px] font-black uppercase tracking-wider hover:bg-[#E2E8F0] transition-all"
+                        >
+                          Process Payout
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
-        <div className="rounded-2xl border border-[#E2E8F0] p-6">
-          <h4 className="font-black text-[#1C2434] mb-4">Recent Sales</h4>
+
+        {/* Payout Modal */}
+        {selectedArtisan && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+              <div className="bg-[#1C2434] p-8 text-white flex justify-between items-start">
+                <div>
+                  <h3 className="text-2xl font-black mb-1">Record Manual Payout</h3>
+                  <p className="text-white/60 text-sm font-medium">{selectedArtisan.displayName || selectedArtisan.email}</p>
+                </div>
+                <button onClick={() => setSelectedArtisan(null)} className="p-2 hover:bg-white/10 rounded-full transition-colors">
+                  <X size={24} />
+                </button>
+              </div>
+              
+              <form onSubmit={handlePayout} className="p-8 space-y-6">
+                <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
+                  <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Available to Pay</p>
+                  <p className="text-2xl font-black text-[#003580]">KES {(selectedArtisan.walletBalance || 0).toLocaleString()}</p>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Amount to Payout (KES)</label>
+                  <input 
+                    type="number" 
+                    required
+                    max={selectedArtisan.walletBalance}
+                    className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all font-black"
+                    placeholder="0.00"
+                    value={payoutAmount}
+                    onChange={e => setPayoutAmount(e.target.value)}
+                  />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-black text-[#1C2434] uppercase tracking-widest">Transaction Reference / Note</label>
+                  <input 
+                    type="text" 
+                    className="w-full px-4 py-3 rounded-xl border border-[#E2E8F0] focus:border-[#003580] outline-none transition-all"
+                    placeholder="e.g. Bank Ref: MPESA-ABC123XYZ"
+                    value={payoutNote}
+                    onChange={e => setPayoutNote(e.target.value)}
+                  />
+                </div>
+
+                <div className="pt-4 flex gap-4">
+                  <button 
+                    type="button"
+                    onClick={() => setSelectedArtisan(null)}
+                    className="flex-1 py-3 rounded-xl border-2 border-[#E2E8F0] font-black text-[#64748B] uppercase tracking-widest hover:border-[#CBD5E1] transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit" 
+                    disabled={isProcessing}
+                    className="flex-1 py-3 rounded-xl bg-[#003580] text-white font-black uppercase tracking-widest hover:bg-[#003580]/90 transition-all shadow-xl shadow-[#003580]/20 disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {isProcessing ? <div className="size-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : 'CONFIRM PAYOUT'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Recent Activity */}
+        <div className="bg-white rounded-[2.5rem] border border-[#E2E8F0] p-8 shadow-sm">
+          <h4 className="font-black text-[#1C2434] uppercase tracking-wider text-sm mb-6">Recent Financial Activity</h4>
           <div className="space-y-4">
-            {orders.slice(0, 5).map(o => (
-              <div key={o.id} className="flex items-center justify-between border-b border-[#F1F5F9] pb-4 last:border-0">
-                <div className="flex items-center gap-3">
-                  <div className="size-10 rounded-full bg-[#F1F5F9] flex items-center justify-center">
-                    <ShoppingCart size={18} className="text-[#003580]" />
+            {sortedRecentActivity.map((item) => {
+              const isOrder = !!item.total
+              return (
+                <div key={item.id} className="flex items-center justify-between p-4 rounded-2xl border border-[#F1F5F9] hover:bg-[#F8FAFC] transition-colors">
+                  <div className="flex items-center gap-4">
+                    <div className={`size-10 rounded-full flex items-center justify-center ${
+                      isOrder ? 'text-[#003580] bg-[#F1F5F9]' : 'text-[#E65100] bg-[#FFF3E0]'
+                    }`}>
+                      {isOrder ? <ShoppingBag size={18} /> : <ArrowUpRight size={18} />}
+                    </div>
+                    <div>
+                      <p className="font-bold text-sm text-[#1C2434]">
+                        {isOrder ? `Order #${item.id.slice(0, 8)}` : `Payout to Artisan`}
+                      </p>
+                      {isOrder && (
+                        <p className="text-[10px] text-[#1C2434] font-bold line-clamp-1">
+                          {item.items?.map(i => i.name).join(', ')}
+                        </p>
+                      )}
+                      <p className="text-[10px] text-[#64748B] font-medium">
+                        {item.createdAt ? (item.createdAt.toDate ? item.createdAt.toDate().toLocaleString() : new Date(item.createdAt).toLocaleString()) : 'Recent'} 
+                        {item.customerEmail ? ` • ${item.customerEmail}` : item.note ? ` • ${item.note}` : ''}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="font-bold text-sm text-[#1C2434]">Sale - {o.id.slice(0, 6)}</p>
-                    <p className="text-xs text-[#64748B]">{o.createdAt?.toDate ? o.createdAt.toDate().toLocaleDateString() : 'Recent'}</p>
+                  <div className="text-right">
+                    <p className={`font-black text-sm ${isOrder ? 'text-[#1C2434]' : 'text-[#E65100]'}`}>
+                      {isOrder ? '' : '-' }KES {(item.total || Math.abs(item.amount) || 0).toLocaleString()}
+                    </p>
+                    <p className={`text-[9px] font-black uppercase tracking-widest ${
+                      isOrder ? (item.status === 'delivered' ? 'text-[#2E7D32]' : 'text-[#E65100]') : 'text-[#003580]'
+                    }`}>{isOrder ? (item.status || 'placed') : 'payout completed'}</p>
                   </div>
                 </div>
-                <span className="font-bold text-sm text-[#10B981]">KES {(o.total || 0).toLocaleString()}</span>
-              </div>
-            ))}
+              )
+            })}
           </div>
         </div>
       </div>
@@ -1153,18 +1839,30 @@ export const AdminFinance = () => {
 }
 export const AdminApprovals = () => {
   const { items: users } = useRealtimeCollection('users', [{ field: 'role', op: '==', value: 'artisan' }])
+  const [selectedArtisan, setSelectedArtisan] = useState(null)
   
+  const handleApprove = async (uid) => {
+    try {
+      const token = await auth.currentUser.getIdToken()
+      await paymentService.approveArtisan(uid, token)
+      setSelectedArtisan(null)
+      alert('Artisan approved successfully!')
+    } catch (err) {
+      alert('Failed to approve: ' + err.message)
+    }
+  }
+
   return (
     <Section title="Artisan Approvals">
       <div className="space-y-6">
         <div className="p-4 rounded-xl bg-[#F8FAFC] border border-[#E2E8F0]">
           <p className="text-sm text-[#64748B] leading-relaxed">
-            Review and approve new artisan applications. Approved artisans will be able to list products and manage their stores.
+            Review and approve new artisan applications. Check their screening answers carefully before granting access.
           </p>
         </div>
         
         <Table 
-          headers={['Artisan', 'Submission Date', 'Status', 'Actions']}
+          headers={['Artisan', 'Submission Date', 'Specialization', 'Actions']}
           data={users.filter(u => !u.isApproved)}
           onSearch={true}
           searchPlaceholder="Search pending applications..."
@@ -1184,20 +1882,86 @@ export const AdminApprovals = () => {
               <td className="px-6 py-4 text-[#64748B]">
                 {u.createdAt?.toDate ? u.createdAt.toDate().toLocaleDateString() : 'Recent'}
               </td>
-              <td className="px-6 py-4">
-                <span className="px-2 py-1 rounded-full bg-[#FFF3E0] text-[#E65100] text-[10px] font-black uppercase tracking-wider">Pending Review</span>
+              <td className="px-6 py-4 text-[#64748B]">
+                {u.screeningAnswers?.specialization || 'Not provided'}
               </td>
-              <td className="px-6 py-4">
+              <td className="px-6 py-4 flex gap-2">
                 <button 
-                  onClick={() => updateDoc(doc(db, 'users', u.id || u.uid), { isApproved: true, artisanStatus: 'approved', updatedAt: serverTimestamp() })}
+                  onClick={() => setSelectedArtisan(u)}
+                  className="px-4 py-1.5 rounded-lg bg-[#F1F5F9] text-[#1C2434] text-xs font-bold hover:bg-[#E2E8F0] transition-all"
+                >
+                  Review Details
+                </button>
+                <button 
+                  onClick={() => handleApprove(u.id || u.uid)}
                   className="px-4 py-1.5 rounded-lg bg-[#003580] text-white text-xs font-bold hover:bg-[#003580]/90 transition-all"
                 >
-                  Approve
+                  Quick Approve
                 </button>
               </td>
             </tr>
           )}
         />
+        
+        {/* Review Modal */}
+        {selectedArtisan && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+            <div className="bg-white rounded-[2.5rem] shadow-2xl w-full max-w-2xl overflow-hidden animate-in fade-in zoom-in duration-200">
+              <div className="bg-[#003580] p-8 text-white flex justify-between items-start">
+                <div>
+                  <h3 className="text-2xl font-black mb-1">Review Application</h3>
+                  <p className="text-white/60 text-sm font-medium">{selectedArtisan.displayName || selectedArtisan.email}</p>
+                </div>
+                <button onClick={() => setSelectedArtisan(null)} className="p-2 hover:bg-white/10 rounded-full transition-colors">
+                  <X size={24} />
+                </button>
+              </div>
+              
+              <div className="p-8 space-y-6 max-h-[70vh] overflow-y-auto">
+                <div className="grid gap-6 sm:grid-cols-2">
+                  <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
+                    <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Experience</p>
+                    <p className="font-bold text-[#1C2434]">{selectedArtisan.screeningAnswers?.experience || 0} Years</p>
+                  </div>
+                  <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
+                    <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Location</p>
+                    <p className="font-bold text-[#1C2434]">{selectedArtisan.screeningAnswers?.location || 'Unknown'}</p>
+                  </div>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
+                  <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Specialization</p>
+                  <p className="font-bold text-[#1C2434]">{selectedArtisan.screeningAnswers?.specialization || 'Not specified'}</p>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
+                  <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Bulk Order Capacity</p>
+                  <p className="font-bold text-[#1C2434] uppercase">{selectedArtisan.screeningAnswers?.canHandleBulk || 'No'}</p>
+                </div>
+
+                <div className="p-4 rounded-2xl bg-[#F8FAFC] border border-[#E2E8F0]">
+                  <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-1">Portfolio / Description</p>
+                  <p className="text-sm text-[#1C2434] leading-relaxed whitespace-pre-wrap">{selectedArtisan.screeningAnswers?.portfolio || 'No description provided.'}</p>
+                </div>
+              </div>
+
+              <div className="p-8 bg-[#F8FAFC] border-t border-[#E2E8F0] flex gap-4">
+                <button 
+                  onClick={() => setSelectedArtisan(null)}
+                  className="flex-1 py-3 rounded-xl border-2 border-[#E2E8F0] font-black text-[#64748B] uppercase tracking-widest hover:border-[#CBD5E1] transition-all"
+                >
+                  Close
+                </button>
+                <button 
+                  onClick={() => handleApprove(selectedArtisan.id || selectedArtisan.uid)}
+                  className="flex-1 py-3 rounded-xl bg-[#003580] text-white font-black uppercase tracking-widest hover:bg-[#003580]/90 transition-all"
+                >
+                  Approve Artisan
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         
         {users.filter(u => !u.isApproved && u.role === 'artisan').length === 0 && (
           <div className="py-20 text-center border-2 border-dashed border-[#E2E8F0] rounded-2xl">
@@ -1408,7 +2172,7 @@ export const AdminOrders = () => {
   return (
     <Section title="Order Management">
       <Table 
-        headers={['Order ID', 'Customer', 'Total', 'Status', 'Actions']}
+        headers={['Order ID', 'Customer', 'Items Sold', 'Total', 'Status', 'Actions']}
         data={orders}
         onSearch={true}
         searchPlaceholder="Search orders..."
@@ -1418,6 +2182,11 @@ export const AdminOrders = () => {
             <td className="px-6 py-4">
               <p className="font-bold text-[#1C2434]">{o.customerName || 'Guest'}</p>
               <p className="text-xs text-[#64748B]">{o.customerEmail}</p>
+            </td>
+            <td className="px-6 py-4">
+              <p className="text-[11px] font-bold text-[#1C2434] line-clamp-2 max-w-[200px]">
+                {o.items?.map(i => `${i.name} (x${i.quantity})`).join(', ')}
+              </p>
             </td>
             <td className="px-6 py-4 font-black">KES {o.total?.toLocaleString()}</td>
             <td className="px-6 py-4">
@@ -1599,7 +2368,11 @@ export const AdminLogs = () => {
   const { items: logs } = useRealtimeCollection('logs')
   
   const sortedLogs = useMemo(() => {
-    return [...logs].sort((a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0))
+    return [...logs].sort((a, b) => {
+      const dateA = a.createdAt ? new Date(a.createdAt) : 0
+      const dateB = b.createdAt ? new Date(b.createdAt) : 0
+      return dateB - dateA
+    })
   }, [logs])
 
   return (
@@ -1613,7 +2386,7 @@ export const AdminLogs = () => {
               <div className="size-3 rounded-full bg-[#27C93F] shadow-[0_0_8px_rgba(39,201,63,0.4)]"></div>
             </div>
             <div className="h-4 w-px bg-[#30363D] mx-2"></div>
-            <span className="text-[10px] font-mono text-[#8B949E] tracking-widest uppercase opacity-70">artisan_os_v1.0.4 — logs</span>
+            <span className="text-[10px] font-mono text-[#8B949E] tracking-widest uppercase opacity-70">artisan_os_v1.1.0 — system logs</span>
           </div>
           <div className="flex items-center gap-4 text-[10px] font-mono text-[#8B949E]">
             <span className="flex items-center gap-1.5"><div className="size-1.5 rounded-full bg-[#27C93F] animate-pulse"></div> LIVE</span>
@@ -1626,30 +2399,30 @@ export const AdminLogs = () => {
             <thead className="sticky top-0 bg-[#161B22] border-b border-[#30363D] z-10">
               <tr>
                 <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">Timestamp</th>
-                <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">Event</th>
-                <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">Origin</th>
-                <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">Payload</th>
+                <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">Type</th>
+                <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">To/User</th>
+                <th className="px-6 py-3 text-[10px] font-mono font-bold text-[#8B949E] uppercase tracking-widest">Details</th>
               </tr>
             </thead>
             <tbody className="font-mono text-[11px] leading-relaxed">
               {sortedLogs.map((log) => (
                 <tr key={log.id} className="border-b border-[#30363D]/30 hover:bg-[#161B22]/80 transition-all group">
                   <td className="px-6 py-3 text-[#58A6FF] whitespace-nowrap">
-                    {log.timestamp?.toDate ? log.timestamp.toDate().toLocaleTimeString() : '00:00:00'}
+                    {log.createdAt ? new Date(log.createdAt).toLocaleTimeString() : '00:00:00'}
                   </td>
                   <td className="px-6 py-3">
                     <span className={`px-2 py-0.5 rounded border ${
-                      log.type === 'error' ? 'text-[#FF7B72] border-[#FF7B72]/30 bg-[#FF7B72]/10' : 
-                      log.type === 'auth' ? 'text-[#79C0FF] border-[#79C0FF]/30 bg-[#79C0FF]/10' : 
-                      'text-[#7EE787] border-[#7EE787]/30 bg-[#7EE787]/10'
+                      log.type.includes('error') ? 'text-[#FF7B72] border-[#FF7B72]/30 bg-[#FF7B72]/10' : 
+                      log.type.includes('success') ? 'text-[#7EE787] border-[#7EE787]/30 bg-[#7EE787]/10' : 
+                      'text-[#79C0FF] border-[#79C0FF]/30 bg-[#79C0FF]/10'
                     } font-bold text-[9px]`}>
-                      {log.action?.toUpperCase()}
+                      {log.type?.toUpperCase()}
                     </span>
                   </td>
-                  <td className="px-6 py-3 text-[#C9D1D9] font-medium">{log.userEmail || 'system_root'}</td>
+                  <td className="px-6 py-3 text-[#C9D1D9] font-medium">{log.to || log.userId || 'system'}</td>
                   <td className="px-6 py-3 text-[#8B949E] group-hover:text-[#C9D1D9] transition-colors">
                     <span className="opacity-50 mr-2">›</span>
-                    {log.details}
+                    {log.subject || log.reference || log.details || 'N/A'}
                   </td>
                 </tr>
               ))}

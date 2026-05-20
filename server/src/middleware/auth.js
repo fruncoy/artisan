@@ -14,11 +14,15 @@ export async function verifyAuth(req, res, next) {
   }
 }
 
-export function requireRole(...roles) {
-  return (req, res, next) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({ message: 'Forbidden for this role' })
-    }
-    next()
+export const requireRole = (role) => (req, res, next) => {
+  if (req.user.role !== role) {
+    return res.status(403).json({ message: 'Forbidden: Insufficient role' })
   }
+  
+  // Extra check for artisans: they must be approved
+  if (role === 'artisan' && req.user.artisanStatus !== 'approved') {
+    return res.status(403).json({ message: 'Forbidden: Artisan account not approved' })
+  }
+  
+  next()
 }
