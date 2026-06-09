@@ -490,7 +490,9 @@ function OrdersPanel({ mode = 'customer' }) {
       {sortedOrders.map((o) => {
         // For artisans, only show their portion of the total and their items
         const myItems = mode === 'artisan' ? o.items?.filter(i => i.artisanId === user?.uid) : o.items
-        const myTotal = mode === 'artisan' ? myItems?.reduce((acc, i) => acc + (i.price * i.quantity), 0) : o.total
+        const myGrossTotal = mode === 'artisan' ? myItems?.reduce((acc, i) => acc + (i.price * i.quantity), 0) : o.total
+        const myCommission = mode === 'artisan' ? myGrossTotal * 0.05 : 0
+        const myNetTotal = myGrossTotal - myCommission
 
         return (
           <div key={o.id} className="flex items-center justify-between p-4 rounded-xl border border-[#E2E8F0] bg-white hover:border-[#003580] transition-all group">
@@ -506,6 +508,11 @@ function OrdersPanel({ mode = 'customer' }) {
                 <p className="text-[11px] text-[#1C2434] font-bold mt-0.5 line-clamp-1">
                   {myItems?.map(i => i.name).join(', ')}
                 </p>
+                {mode === 'artisan' && (
+                  <p className="text-[10px] text-[#64748B] font-medium mt-1">
+                    Gross: KES {myGrossTotal.toLocaleString()} • Commission: -KES {myCommission.toLocaleString()}
+                  </p>
+                )}
                 {mode !== 'customer' && (
                   <p className="text-[10px] text-[#003580] font-bold mt-1 uppercase tracking-wider">
                     Deliver to: {o.customerLocation || 'No Address Set'}
@@ -515,7 +522,7 @@ function OrdersPanel({ mode = 'customer' }) {
             </div>
             <div className="flex items-center gap-4">
               <div className="text-right">
-                <p className="font-black text-sm text-[#1C2434]">KES {(myTotal || 0).toLocaleString()}</p>
+                <p className="font-black text-sm text-[#1C2434]">KES {(myNetTotal || 0).toLocaleString()}</p>
                 <span className={`inline-block px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-widest ${
                   o.status === 'delivered' ? 'bg-[#E8F5E9] text-[#2E7D32]' : 
                   o.status === 'processing' ? 'bg-[#E0E7FF] text-[#003580]' :
@@ -1625,12 +1632,14 @@ export const AdminFinance = () => {
   const { items: orders } = useRealtimeCollection('orders')
   const { items: artisans } = useRealtimeCollection('users', [{ field: 'role', op: '==', value: 'artisan' }])
   const { items: transactions } = useRealtimeCollection('transactions')
+  const { items: commissions } = useRealtimeCollection('commissions')
   const [selectedArtisan, setSelectedArtisan] = useState(null)
   const [payoutAmount, setPayoutAmount] = useState('')
   const [payoutNote, setPayoutNote] = useState('')
   const [isProcessing, setIsProcessing] = useState(false)
 
   const totalRevenue = useMemo(() => orders.reduce((acc, o) => acc + (o.total || 0), 0), [orders])
+  const totalCommissions = useMemo(() => commissions.reduce((acc, c) => acc + (c.amount || 0), 0), [commissions])
   const totalPayouts = useMemo(() => {
     return transactions
       .filter(t => t.type === 'payout')
@@ -1676,20 +1685,35 @@ export const AdminFinance = () => {
       <div className="space-y-8">
         {/* Top Cards */}
         <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
-          <div className="lg:col-span-1 rounded-[2.5rem] bg-[#1C2434] p-8 text-white shadow-xl relative overflow-hidden">
+          <div className="rounded-[2.5rem] bg-[#1C2434] p-8 text-white shadow-xl relative overflow-hidden">
             <div className="absolute -right-10 -top-10 size-40 bg-white/5 rounded-full blur-3xl" />
-            <p className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-2 relative z-10">Platform Total Sales</p>
+            <p className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-2 relative z-10">Total Sales Revenue</p>
             <h3 className="text-4xl font-black mb-2 relative z-10">KES {totalRevenue.toLocaleString()}</h3>
-            <p className="text-[10px] font-bold text-[#10B981] uppercase tracking-widest mb-8 relative z-10">
-              Total Payouts: KES {totalPayouts.toLocaleString()}
+            <p className="text-[10px] font-bold text-[#10B981] uppercase tracking-widest relative z-10">
+              Gross Platform Volume
             </p>
-            <button className="w-full py-3 bg-white/10 hover:bg-white/20 rounded-xl font-bold transition-all backdrop-blur-md border border-white/10 relative z-10">
-              Generate Finance Report
-            </button>
           </div>
 
-          <div className="lg:col-span-2 bg-white rounded-[2.5rem] border border-[#E2E8F0] p-8 shadow-sm">
-            <div className="flex items-center justify-between mb-6">
+          <div className="rounded-[2.5rem] bg-[#003580] p-8 text-white shadow-xl relative overflow-hidden">
+            <div className="absolute -right-10 -top-10 size-40 bg-white/10 rounded-full blur-3xl" />
+            <p className="text-[10px] font-black text-white/40 uppercase tracking-widest mb-2 relative z-10">Total Commission (5%)</p>
+            <h3 className="text-4xl font-black mb-2 relative z-10">KES {totalCommissions.toLocaleString()}</h3>
+            <p className="text-[10px] font-bold text-[#38BDF8] uppercase tracking-widest relative z-10">
+              Net Platform Earnings
+            </p>
+          </div>
+
+          <div className="rounded-[2.5rem] bg-[#F8FAFC] p-8 border border-[#E2E8F0] shadow-sm relative overflow-hidden">
+            <p className="text-[10px] font-black text-[#64748B] uppercase tracking-widest mb-2 relative z-10">Total Artisan Payouts</p>
+            <h3 className="text-4xl font-black text-[#1C2434] mb-2 relative z-10">KES {totalPayouts.toLocaleString()}</h3>
+            <p className="text-[10px] font-bold text-[#E65100] uppercase tracking-widest relative z-10">
+              Funds Disbursed
+            </p>
+          </div>
+        </div>
+
+        <div className="bg-white rounded-[2.5rem] border border-[#E2E8F0] p-8 shadow-sm">
+          <div className="flex items-center justify-between mb-6">
               <h4 className="font-black text-[#1C2434] uppercase tracking-wider text-sm">Artisan Balances & Payouts</h4>
               <p className="text-[10px] font-bold text-[#64748B] uppercase">Total Artisans: {artisans.length}</p>
             </div>
@@ -1724,7 +1748,6 @@ export const AdminFinance = () => {
               </table>
             </div>
           </div>
-        </div>
 
         {/* Payout Modal */}
         {selectedArtisan && (

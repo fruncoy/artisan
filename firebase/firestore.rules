@@ -33,13 +33,18 @@ service cloud.firestore {
     match /orders/{orderId} {
       allow read: if isAuthed() &&
         (resource.data.customerId == request.auth.uid ||
-         resource.data.artisanId == request.auth.uid ||
+         request.auth.uid in resource.data.artisanIds ||
          isAdmin());
       allow create: if isAuthed() && request.resource.data.customerId == request.auth.uid;
       allow update: if isAuthed() &&
         (resource.data.customerId == request.auth.uid ||
-         resource.data.artisanId == request.auth.uid ||
+         request.auth.uid in resource.data.artisanIds ||
          isAdmin());
+    }
+
+    match /commissions/{commId} {
+      allow read: if isAdmin();
+      allow write: if false; // Server only
     }
 
     match /stores/{storeId} {

@@ -21,10 +21,8 @@ userRouter.post('/sync', verifyAuth, async (req, res) => {
     
     // Check if welcome email already sent
     if (!userData.welcomeEmailSent) {
+      console.log(`Sending welcome email to: ${email} (Role: ${userData.role})`);
       if (userData.role === 'artisan') {
-        // For artisans, we send a "application received" email if they just signed up or filled screening
-        // But if they are already approved, maybe we send the welcome?
-        // Let's stick to the logic: artisans get "application received" first.
         if (userData.artisanStatus === 'pending') {
           await emailService.sendArtisanApplicationReceived({ email, displayName });
         }

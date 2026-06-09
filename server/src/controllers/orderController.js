@@ -122,33 +122,53 @@ export async function placeOrder(req, res) {
         createdAt: new Date().toISOString() 
       })
 
-      // 4. Update Artisans & Record Sales (Credit)
+      // 4. Update Artisans & Record Sales (Credit minus 5% commission)
       for (const [aId, amount] of Object.entries(artisanEarnings)) {
         const aRef = db.collection('users').doc(aId)
         // In a transaction, we must have read this document already
         const aData = snapsMap.get(aRef.path)
         const aBalance = aData ? (Number(aData.walletBalance) || 0) : 0
         
+        const commissionRate = 0.05
+        const commissionAmount = amount * commissionRate
+        const netAmount = amount - commissionAmount
+
         t.update(aRef, { 
-          walletBalance: aBalance + amount, 
+          walletBalance: aBalance + netAmount, 
           updatedAt: new Date().toISOString() 
         })
         
         const artisanTransRef = db.collection('transactions').doc()
         t.set(artisanTransRef, { 
           userId: aId, 
-          amount, 
+          amount: netAmount,
+          grossAmount: amount,
+          commissionAmount: commissionAmount,
           type: 'sale', 
           orderId: orderRef.id, 
           status: 'success',
           createdAt: new Date().toISOString() 
+        })
+
+        // Also track total commission in a central place for admin (optional but helpful)
+        const commissionRef = db.collection('commissions').doc()
+        t.set(commissionRef, {
+          orderId: orderRef.id,
+          artisanId: aId,
+          amount: commissionAmount,
+          grossAmount: amount,
+          createdAt: new Date().toISOString()
         })
       }
     })
 
     // 4. Send Emails (Non-blocking)
     try {
-      const orderData = { id: orderRef.id, total: totalAmount }
+      const orderData = { 
+        id: orderRef.id, 
+        total: totalAmount, 
+        items: verifiedItems 
+      }
       emailService.sendOrderConfirmation(orderData, { email: customerEmail, displayName: req.user.name })
       
       // Notify artisans
@@ -209,13 +229,17 @@ export async function getArtisanOrders(req, res) {
     const orders = snap.docs.map(d => {
       const data = d.data()
       const myItems = data.items.filter(i => i.artisanId === req.user.uid)
-      const myTotal = myItems.reduce((acc, i) => acc + (i.price * i.quantity), 0)
+      const myGrossTotal = myItems.reduce((acc, i) => acc + (i.price * i.quantity), 0)
+      const myCommission = myGrossTotal * 0.05
+      const myNetTotal = myGrossTotal - myCommission
       
       return { 
         id: d.id, 
         ...data,
         items: myItems,
-        total: myTotal // Artisan sees their portion of the order
+        grossTotal: myGrossTotal,
+        commission: myCommission,
+        total: myNetTotal // Artisan sees their net payout as the main total
       }
     })
 

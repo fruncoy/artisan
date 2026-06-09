@@ -128,7 +128,13 @@ export const emailService = {
   },
 
   sendArtisanOrderNotification: async (order, artisan) => {
-    const itemsList = order.items?.filter(i => i.artisanId === artisan.uid || i.artisanId === artisan.id).map(i => `<li>${i.name} (x${i.quantity})</li>`).join('') || '<li>Items for your store</li>';
+    const myItems = order.items?.filter(i => i.artisanId === artisan.uid || i.artisanId === artisan.id) || [];
+    const itemsList = myItems.map(i => `<li>${i.name} (x${i.quantity})</li>`).join('') || '<li>Items for your store</li>';
+    
+    const grossEarnings = myItems.reduce((acc, i) => acc + (i.price * i.quantity), 0);
+    const commission = grossEarnings * 0.05;
+    const netEarnings = grossEarnings - commission;
+
     const subject = `New Order Received! #${order.id.slice(0, 8)}`;
     const htmlContent = `
       <div style="font-family: sans-serif; color: #1C2434; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #E2E8F0; border-radius: 12px;">
@@ -141,6 +147,11 @@ export const emailService = {
           <ul style="margin: 0; padding-left: 20px; font-weight: 500;">
             ${itemsList}
           </ul>
+          <div style="margin-top: 20px; border-top: 1px solid #E2E8F0; padding-top: 12px;">
+            <p style="margin: 4px 0;">Gross Earnings: <strong>KES ${grossEarnings.toLocaleString()}</strong></p>
+            <p style="margin: 4px 0; color: #EF4444;">Commission (5%): <strong>- KES ${commission.toLocaleString()}</strong></p>
+            <p style="margin: 8px 0; font-size: 18px;">Net Payout: <strong>KES ${netEarnings.toLocaleString()}</strong></p>
+          </div>
           <p style="margin-top: 16px; font-size: 12px; color: #64748B;">Order ID: #${order.id.slice(0, 8)}</p>
         </div>
 
