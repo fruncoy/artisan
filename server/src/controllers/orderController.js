@@ -219,14 +219,39 @@ export async function getMyOrders(req, res) {
 
 export async function getArtisanOrders(req, res) {
   try {
-    // Orders where this artisan is involved
-    const snap = await db.collection('orders')
-      .where('artisanIds', 'array-contains', req.user.uid)
-      .orderBy('createdAt', 'desc')
-      .get()
+    // Orders where this artisan is involved (Try both new array field and legacy singular field)
+    const [newOrdersSnap, legacyOrdersSnap] = await Promise.all([
+      db.collection('orders')
+        .where('artisanIds', 'array-contains', req.user.uid)
+        .orderBy('createdAt', 'desc')
+        .get(),
+      db.collection('orders')
+        .where('artisanId', '==', req.user.uid)
+        .orderBy('createdAt', 'desc')
+        .get()
+    ])
+    
+    // Combine results and remove duplicates
+    const allDocs = [...newOrdersSnap.docs, ...legacyOrdersSnap.docs]
+    const seenIds = new Set()
+    const uniqueDocs = []
+    
+    for (const doc of allDocs) {
+      if (!seenIds.has(doc.id)) {
+        seenIds.add(doc.id)
+        uniqueDocs.push(doc)
+      }
+    }
+
+    // Sort combined results by createdAt desc
+    uniqueDocs.sort((a, b) => {
+      const dateA = new Date(a.data().createdAt || 0)
+      const dateB = new Date(b.data().createdAt || 0)
+      return dateB - dateA
+    })
     
     // Filter items to only show what belongs to this artisan for clarity
-    const orders = snap.docs.map(d => {
+    const orders = uniqueDocs.map(d => {
       const data = d.data()
       const myItems = data.items.filter(i => i.artisanId === req.user.uid)
       const myGrossTotal = myItems.reduce((acc, i) => acc + (i.price * i.quantity), 0)

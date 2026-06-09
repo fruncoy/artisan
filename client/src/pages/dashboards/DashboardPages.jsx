@@ -455,16 +455,17 @@ function OrdersPanel({ mode = 'customer' }) {
 
   const { items: orders, loading } = useRealtimeCollection(collectionName, constraints)
   
-  // Fallback for old orders that might be missing the artisanIds index field
-  const { items: allOrders } = useRealtimeCollection(collectionName, mode === 'artisan' && orders.length === 0 ? [] : [{ field: '___none___', op: '==', value: '___none___' }])
+  // Fallback for old orders that might use 'artisanId' instead of 'artisanIds'
+  const { items: legacyOrders } = useRealtimeCollection(collectionName, mode === 'artisan' && !loading && orders.length === 0 
+    ? [{ field: 'artisanId', op: '==', value: user?.uid || '__none__' }] 
+    : [{ field: '___none___', op: '==', value: '___none___' }])
   
   const displayOrders = useMemo(() => {
-    if (mode === 'artisan' && orders.length === 0 && allOrders.length > 0) {
-      // Fallback: search through all orders for items belonging to this artisan
-      return allOrders.filter(o => o.items?.some(i => i.artisanId === user?.uid))
+    if (mode === 'artisan' && orders.length === 0) {
+      return legacyOrders
     }
     return orders
-  }, [orders, allOrders, mode, user?.uid])
+  }, [orders, legacyOrders, mode])
   
   const handleUpdateStatus = async (orderId, newStatus) => {
     try {
@@ -1095,15 +1096,17 @@ export const ArtisanWallet = () => {
 }
 export const ArtisanAnalytics = () => {
   const user = useAuthStore((s) => s.user)
-  const { items: initialOrders } = useRealtimeCollection('orders', [{ field: 'artisanIds', op: 'array-contains', value: user?.uid || '__none__' }])
-  const { items: allOrders } = useRealtimeCollection('orders', initialOrders.length === 0 ? [] : [{ field: '___none___', op: '==', value: '___none___' }])
+  const { items: initialOrders, loading } = useRealtimeCollection('orders', [{ field: 'artisanIds', op: 'array-contains', value: user?.uid || '__none__' }])
+  const { items: legacyOrders } = useRealtimeCollection('orders', !loading && initialOrders.length === 0 
+    ? [{ field: 'artisanId', op: '==', value: user?.uid || '__none__' }] 
+    : [{ field: '___none___', op: '==', value: '___none___' }])
 
   const orders = useMemo(() => {
-    if (initialOrders.length === 0 && allOrders.length > 0) {
-      return allOrders.filter(o => o.items?.some(i => i.artisanId === user?.uid))
+    if (initialOrders.length === 0) {
+      return legacyOrders
     }
     return initialOrders
-  }, [initialOrders, allOrders, user?.uid])
+  }, [initialOrders, legacyOrders])
   
   const salesByMonth = useMemo(() => {
     const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
